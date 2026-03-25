@@ -1,0 +1,13 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "{AE47B285-4E47-C71B-AB7B-ECBE6C9DFA57}",
+	"Category": "",
+	"Description": "",
+	"Modules": [
+		{
+			"Name": "WishGI",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
