@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "WishGI Offline Tools",
+	"Description": "MVP offline tooling for WishGI mesh preprocessing and scene baking.",
+	"Category": "Rendering",
+	"CreatedBy": "Codex",
+	"EnabledByDefault": false,
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Modules": [
+		{
+			"Name": "WishGIEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
