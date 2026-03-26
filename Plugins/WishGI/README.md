@@ -28,9 +28,10 @@ Builds a scene-level probe map asset from mesh association assets.
 
 Current MVP flow:
 - Read mesh association assets
-- Aggregate per-probe coverage from vertex associations
-- Generate deterministic SH placeholder records per probe
-- Build mesh probe ranges and suggested probe map size
+- Build per-mesh dense linear systems from vertex-probe associations
+- Solve probe signals with Conjugate Gradient on normal equations
+- Apply a lightweight regularization term controlled by `-Lambda`
+- Pack solved probe records and mesh ranges into one `UWishGIProbeMapAsset`
 
 Example:
 
@@ -41,5 +42,5 @@ UE4Editor-Cmd.exe YourProject.uproject -run=WishGIBakeScene -AssocPath=/Game/Wis
 ## Notes
 
 - This is an MVP scaffold focused on offline pipeline connectivity.
-- Probe visibility graph, A*/Dijkstra distance metric, and full light fitting solver are not implemented yet.
+- Probe visibility graph, A*/Dijkstra distance metric, and real scene-radiance sampling are not implemented yet.
 - Runtime shader integration is out of scope of this plugin stage.
