@@ -44,6 +44,9 @@ public:
 	FString SourceMapPath;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	FString TargetSource = TEXT("Synthetic");
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	int32 SHOrder = 2;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
@@ -60,6 +63,15 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	float SolverResidual = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	int32 RealSampleQueryCount = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	int32 RealSampleValidCount = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	float RealSampleValidRatio = 0.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	FIntPoint SuggestedProbeMapSize = FIntPoint::ZeroValue;
