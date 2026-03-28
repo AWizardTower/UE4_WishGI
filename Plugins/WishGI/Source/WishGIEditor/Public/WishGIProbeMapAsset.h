@@ -17,6 +17,9 @@ struct FWishGIProbeSHRecord
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	FLinearColor Pixel1 = FLinearColor::Black;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	TArray<FLinearColor> SHCoefficients;
 };
 
 USTRUCT(BlueprintType)
@@ -53,6 +56,9 @@ public:
 	int32 DirectionCount = 192;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	int32 SHCoefficientCount = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	float Lambda = 0.1f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
@@ -85,3 +91,4 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	TArray<FWishGIProbeMeshRange> MeshRanges;
 };
+

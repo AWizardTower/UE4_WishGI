@@ -139,6 +139,17 @@ struct FSurfaceSampleTargets
 	bool bHasAnyRealSample = false;
 };
 
+struct FSurfaceSampleSHTargets
+{
+	int32 CoefficientCount = 0;
+	TArray<double> R;
+	TArray<double> G;
+	TArray<double> B;
+	TArray<uint8> ValidMask;
+	FTargetStats Stats;
+	bool bHasAnyRealSample = false;
+};
+
 struct FLinearSystemDense
 {
 	int32 Size = 0;
@@ -163,6 +174,17 @@ struct FSolvedSignals
 	FSolveStats StatsB;
 };
 
+struct FSolvedProbeSHSignals
+{
+	int32 CoefficientCount = 0;
+	TArray<float> R;
+	TArray<float> G;
+	TArray<float> B;
+	int32 SolveCount = 0;
+	int32 IterationSum = 0;
+	double ResidualSum = 0.0;
+};
+
 FORCEINLINE int32 MatIndex(int32 Size, int32 Row, int32 Col)
 {
 	return Row * Size + Col;
@@ -176,6 +198,177 @@ FORCEINLINE double& At(FLinearSystemDense& System, int32 Row, int32 Col)
 FORCEINLINE double AtConst(const FLinearSystemDense& System, int32 Row, int32 Col)
 {
 	return System.A[MatIndex(System.Size, Row, Col)];
+}
+
+FORCEINLINE int32 SHFlatIndex(int32 ElementIndex, int32 CoefficientIndex, int32 CoefficientCount)
+{
+	return ElementIndex * CoefficientCount + CoefficientIndex;
+}
+
+static int32 GetSHCoefficientCount(int32 SHOrder)
+{
+	return (SHOrder >= 3) ? 16 : 9;
+}
+
+static void EvaluateSHBasis(int32 SHOrder, const FVector& Direction, TArray<double>& OutBasis)
+{
+	const FVector SafeDirection = Direction.GetSafeNormal();
+	if (SHOrder >= 3)
+	{
+		const TSHVector<4> Basis = TSHVector<4>::SHBasisFunction(SafeDirection);
+		OutBasis.SetNum(16);
+		for (int32 Index = 0; Index < 16; ++Index)
+		{
+			OutBasis[Index] = static_cast<double>(Basis.V[Index]);
+		}
+		return;
+	}
+
+	const FSHVector3 Basis = FSHVector3::SHBasisFunction(SafeDirection);
+	OutBasis.SetNum(9);
+	for (int32 Index = 0; Index < 9; ++Index)
+	{
+		OutBasis[Index] = static_cast<double>(Basis.V[Index]);
+	}
+}
+
+static bool SolveSmallDenseLinearSystem(int32 Size, TArray<double> Matrix, TArray<double> RHS, TArray<double>& OutSolution)
+{
+	OutSolution.Init(0.0, Size);
+	if (Size <= 0 || Matrix.Num() != Size * Size || RHS.Num() != Size)
+	{
+		return false;
+	}
+
+	for (int32 PivotIndex = 0; PivotIndex < Size; ++PivotIndex)
+	{
+		int32 BestRow = PivotIndex;
+		double BestValue = FMath::Abs(Matrix[MatIndex(Size, PivotIndex, PivotIndex)]);
+		for (int32 Row = PivotIndex + 1; Row < Size; ++Row)
+		{
+			const double Candidate = FMath::Abs(Matrix[MatIndex(Size, Row, PivotIndex)]);
+			if (Candidate > BestValue)
+			{
+				BestValue = Candidate;
+				BestRow = Row;
+			}
+		}
+
+		if (BestValue <= 1e-12)
+		{
+			return false;
+		}
+
+		if (BestRow != PivotIndex)
+		{
+			for (int32 Col = PivotIndex; Col < Size; ++Col)
+			{
+				Swap(Matrix[MatIndex(Size, PivotIndex, Col)], Matrix[MatIndex(Size, BestRow, Col)]);
+			}
+			Swap(RHS[PivotIndex], RHS[BestRow]);
+		}
+
+		const double Pivot = Matrix[MatIndex(Size, PivotIndex, PivotIndex)];
+		for (int32 Col = PivotIndex; Col < Size; ++Col)
+		{
+			Matrix[MatIndex(Size, PivotIndex, Col)] /= Pivot;
+		}
+		RHS[PivotIndex] /= Pivot;
+
+		for (int32 Row = 0; Row < Size; ++Row)
+		{
+			if (Row == PivotIndex)
+			{
+				continue;
+			}
+
+			const double Factor = Matrix[MatIndex(Size, Row, PivotIndex)];
+			if (FMath::Abs(Factor) <= 1e-18)
+			{
+				continue;
+			}
+
+			for (int32 Col = PivotIndex; Col < Size; ++Col)
+			{
+				Matrix[MatIndex(Size, Row, Col)] -= Factor * Matrix[MatIndex(Size, PivotIndex, Col)];
+			}
+			RHS[Row] -= Factor * RHS[PivotIndex];
+		}
+	}
+
+	OutSolution = MoveTemp(RHS);
+	return true;
+}
+
+static bool FitSampleSHCoefficients(
+	int32 SHOrder,
+	const FVector& SurfaceNormal,
+	const TArray<FVector>& Directions,
+	const TArray<FLinearColor>& LightingSamples,
+	TArray<double>& OutR,
+	TArray<double>& OutG,
+	TArray<double>& OutB)
+{
+	const int32 CoefficientCount = GetSHCoefficientCount(SHOrder);
+	if (Directions.Num() != LightingSamples.Num() || Directions.Num() < CoefficientCount)
+	{
+		return false;
+	}
+
+	TArray<double> Matrix;
+	Matrix.Init(0.0, CoefficientCount * CoefficientCount);
+	TArray<double> RHSR;
+	TArray<double> RHSG;
+	TArray<double> RHSB;
+	RHSR.Init(0.0, CoefficientCount);
+	RHSG.Init(0.0, CoefficientCount);
+	RHSB.Init(0.0, CoefficientCount);
+
+	FVector SafeNormal = SurfaceNormal.GetSafeNormal();
+	if (SafeNormal.IsNearlyZero())
+	{
+		SafeNormal = FVector::UpVector;
+	}
+
+	TArray<double> Basis;
+	double WeightSum = 0.0;
+	for (int32 DirectionIndex = 0; DirectionIndex < Directions.Num(); ++DirectionIndex)
+	{
+		const FVector Direction = Directions[DirectionIndex].GetSafeNormal();
+		const double Weight = FMath::Max(0.0, static_cast<double>(FVector::DotProduct(SafeNormal, Direction)));
+		if (Weight <= 0.0)
+		{
+			continue;
+		}
+
+		EvaluateSHBasis(SHOrder, Direction, Basis);
+		for (int32 Row = 0; Row < CoefficientCount; ++Row)
+		{
+			const double BasisRow = Basis[Row];
+			RHSR[Row] += Weight * BasisRow * static_cast<double>(LightingSamples[DirectionIndex].R);
+			RHSG[Row] += Weight * BasisRow * static_cast<double>(LightingSamples[DirectionIndex].G);
+			RHSB[Row] += Weight * BasisRow * static_cast<double>(LightingSamples[DirectionIndex].B);
+			for (int32 Col = 0; Col < CoefficientCount; ++Col)
+			{
+				Matrix[MatIndex(CoefficientCount, Row, Col)] += Weight * BasisRow * Basis[Col];
+			}
+		}
+		WeightSum += Weight;
+	}
+
+	if (WeightSum <= 1e-8)
+	{
+		return false;
+	}
+
+	for (int32 Index = 0; Index < CoefficientCount; ++Index)
+	{
+		Matrix[MatIndex(CoefficientCount, Index, Index)] += 1e-4;
+	}
+
+	return SolveSmallDenseLinearSystem(CoefficientCount, Matrix, RHSR, OutR)
+		&& SolveSmallDenseLinearSystem(CoefficientCount, Matrix, RHSG, OutG)
+		&& SolveSmallDenseLinearSystem(CoefficientCount, Matrix, RHSB, OutB);
 }
 
 static bool IsObjectPath(const FString& InPath)
@@ -1151,6 +1344,103 @@ static void BuildSyntheticTargets(const UWishGIMeshAssocAsset* AssocAsset, FVert
 	}
 }
 
+static bool BuildSurfaceSampleSHTargetsFromRayTrace(const UWishGIMeshAssocAsset* AssocAsset, const FTargetContext& TargetContext, int32 SHOrder, FSurfaceSampleSHTargets& OutTargets)
+{
+	OutTargets = FSurfaceSampleSHTargets();
+	if (!AssocAsset || !TargetContext.World || AssocAsset->SurfaceSamples.Num() <= 0)
+	{
+		return false;
+	}
+
+	const int32 CoefficientCount = GetSHCoefficientCount(SHOrder);
+	if (TargetContext.DirectionSamples.Num() < CoefficientCount)
+	{
+		UE_LOG(LogWishGIBakeScene, Warning, TEXT("RT SH fitting requires at least %d directions, got %d."), CoefficientCount, TargetContext.DirectionSamples.Num());
+		return false;
+	}
+
+	const UStaticMesh* SourceMesh = AssocAsset->SourceMesh.LoadSynchronous();
+	TArray<FTransform> InstanceTransforms;
+	GatherMeshInstanceTransforms(TargetContext.World, SourceMesh, InstanceTransforms);
+	if (InstanceTransforms.Num() == 0)
+	{
+		return false;
+	}
+
+	const int32 SampleCount = AssocAsset->SurfaceSamples.Num();
+	OutTargets.CoefficientCount = CoefficientCount;
+	OutTargets.R.Init(0.0, SampleCount * CoefficientCount);
+	OutTargets.G.Init(0.0, SampleCount * CoefficientCount);
+	OutTargets.B.Init(0.0, SampleCount * CoefficientCount);
+	OutTargets.ValidMask.Init(0, SampleCount);
+
+	TArray<FLinearColor> DirectionalLighting;
+	DirectionalLighting.SetNum(TargetContext.DirectionSamples.Num());
+	TArray<double> FitR;
+	TArray<double> FitG;
+	TArray<double> FitB;
+
+	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		const FWishGISurfaceSample& SurfaceSample = AssocAsset->SurfaceSamples[SampleIndex];
+		TArray<double> AccR;
+		TArray<double> AccG;
+		TArray<double> AccB;
+		AccR.Init(0.0, CoefficientCount);
+		AccG.Init(0.0, CoefficientCount);
+		AccB.Init(0.0, CoefficientCount);
+		int32 ValidInstances = 0;
+
+		for (const FTransform& Transform : InstanceTransforms)
+		{
+			const FVector WorldPosition = Transform.TransformPosition(SurfaceSample.LocalPosition);
+			FVector WorldNormal = Transform.TransformVectorNoScale(SurfaceSample.LocalNormal).GetSafeNormal();
+			if (WorldNormal.IsNearlyZero())
+			{
+				WorldNormal = FVector::UpVector;
+			}
+
+			for (int32 DirectionIndex = 0; DirectionIndex < TargetContext.DirectionSamples.Num(); ++DirectionIndex)
+			{
+				OutTargets.Stats.QueryCount += 1;
+				DirectionalLighting[DirectionIndex] = SampleRayTracedLightingAt(TargetContext, WorldPosition, TargetContext.DirectionSamples[DirectionIndex]);
+				OutTargets.Stats.ValidCount += 1;
+			}
+
+			if (!FitSampleSHCoefficients(SHOrder, WorldNormal, TargetContext.DirectionSamples, DirectionalLighting, FitR, FitG, FitB))
+			{
+				continue;
+			}
+
+			for (int32 CoefficientIndex = 0; CoefficientIndex < CoefficientCount; ++CoefficientIndex)
+			{
+				AccR[CoefficientIndex] += FitR[CoefficientIndex];
+				AccG[CoefficientIndex] += FitG[CoefficientIndex];
+				AccB[CoefficientIndex] += FitB[CoefficientIndex];
+			}
+			ValidInstances += 1;
+		}
+
+		if (ValidInstances <= 0)
+		{
+			continue;
+		}
+
+		const double InvValidCount = 1.0 / static_cast<double>(ValidInstances);
+		for (int32 CoefficientIndex = 0; CoefficientIndex < CoefficientCount; ++CoefficientIndex)
+		{
+			const int32 FlatIndex = SHFlatIndex(SampleIndex, CoefficientIndex, CoefficientCount);
+			OutTargets.R[FlatIndex] = AccR[CoefficientIndex] * InvValidCount;
+			OutTargets.G[FlatIndex] = AccG[CoefficientIndex] * InvValidCount;
+			OutTargets.B[FlatIndex] = AccB[CoefficientIndex] * InvValidCount;
+		}
+		OutTargets.ValidMask[SampleIndex] = 1;
+		OutTargets.bHasAnyRealSample = true;
+	}
+
+	return OutTargets.bHasAnyRealSample;
+}
+
 static bool BuildSurfaceSampleTargetsFromRayTrace(const UWishGIMeshAssocAsset* AssocAsset, const FTargetContext& TargetContext, FSurfaceSampleTargets& OutTargets)
 {
 	OutTargets = FSurfaceSampleTargets();
@@ -1961,12 +2251,125 @@ static bool SolveProbeSignals(
 	return true;
 }
 
+static bool SolveProbeSHSignalsFromRayTrace(
+	const UWishGIMeshAssocAsset* AssocAsset,
+	int32 MeshProbeCount,
+	float Lambda,
+	const FTargetContext& TargetContext,
+	int32 SHOrder,
+	FSolvedProbeSHSignals& OutResult,
+	FTargetStats& OutTargetStats)
+{
+	OutResult = FSolvedProbeSHSignals();
+	OutTargetStats = FTargetStats();
+	if (!AssocAsset || MeshProbeCount <= 0)
+	{
+		return false;
+	}
+
+	FSurfaceSampleSHTargets Targets;
+	if (!BuildSurfaceSampleSHTargetsFromRayTrace(AssocAsset, TargetContext, SHOrder, Targets))
+	{
+		return false;
+	}
+
+	const int32 CoefficientCount = Targets.CoefficientCount;
+	const int32 SampleCount = FMath::Min(AssocAsset->SurfaceSamples.Num(), Targets.ValidMask.Num());
+	const int32 MaxIterations = FMath::Clamp(MeshProbeCount * 4, 32, 512);
+	const double Tolerance = 1e-5;
+
+	OutResult.CoefficientCount = CoefficientCount;
+	OutResult.R.Init(0.0f, MeshProbeCount * CoefficientCount);
+	OutResult.G.Init(0.0f, MeshProbeCount * CoefficientCount);
+	OutResult.B.Init(0.0f, MeshProbeCount * CoefficientCount);
+	OutTargetStats = Targets.Stats;
+
+	for (int32 CoefficientIndex = 0; CoefficientIndex < CoefficientCount; ++CoefficientIndex)
+	{
+		FSurfaceSampleTargets CoefficientTargets;
+		CoefficientTargets.R.Init(0.0, SampleCount);
+		CoefficientTargets.G.Init(0.0, SampleCount);
+		CoefficientTargets.B.Init(0.0, SampleCount);
+		CoefficientTargets.ValidMask = Targets.ValidMask;
+		CoefficientTargets.Stats = Targets.Stats;
+		CoefficientTargets.bHasAnyRealSample = Targets.bHasAnyRealSample;
+
+		for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+		{
+			const int32 FlatIndex = SHFlatIndex(SampleIndex, CoefficientIndex, CoefficientCount);
+			CoefficientTargets.R[SampleIndex] = Targets.R[FlatIndex];
+			CoefficientTargets.G[SampleIndex] = Targets.G[FlatIndex];
+			CoefficientTargets.B[SampleIndex] = Targets.B[FlatIndex];
+		}
+
+		FLinearSystemDense SystemR;
+		FLinearSystemDense SystemG;
+		FLinearSystemDense SystemB;
+		BuildSystemsFromSurfaceSamples(AssocAsset, CoefficientTargets, MeshProbeCount, Lambda, SystemR, SystemG, SystemB);
+
+		TArray<double> XR;
+		TArray<double> XG;
+		TArray<double> XB;
+		const FSolveStats StatsR = SolveByConjugateGradient(SystemR, XR, MaxIterations, Tolerance);
+		const FSolveStats StatsG = SolveByConjugateGradient(SystemG, XG, MaxIterations, Tolerance);
+		const FSolveStats StatsB = SolveByConjugateGradient(SystemB, XB, MaxIterations, Tolerance);
+
+		auto AccStats = [&OutResult](const FSolveStats& Stats)
+		{
+			if (Stats.Iterations > 0)
+			{
+				OutResult.IterationSum += Stats.Iterations;
+				OutResult.ResidualSum += Stats.Residual;
+				OutResult.SolveCount += 1;
+			}
+		};
+		AccStats(StatsR);
+		AccStats(StatsG);
+		AccStats(StatsB);
+
+		for (int32 ProbeIndex = 0; ProbeIndex < MeshProbeCount; ++ProbeIndex)
+		{
+			const int32 ProbeFlatIndex = SHFlatIndex(ProbeIndex, CoefficientIndex, CoefficientCount);
+			OutResult.R[ProbeFlatIndex] = XR.IsValidIndex(ProbeIndex) ? static_cast<float>(XR[ProbeIndex]) : 0.0f;
+			OutResult.G[ProbeFlatIndex] = XG.IsValidIndex(ProbeIndex) ? static_cast<float>(XG[ProbeIndex]) : 0.0f;
+			OutResult.B[ProbeFlatIndex] = XB.IsValidIndex(ProbeIndex) ? static_cast<float>(XB[ProbeIndex]) : 0.0f;
+		}
+	}
+
+	return true;
+}
+
 static FLinearColor BuildTint(uint32 Hash)
 {
 	const float R = 0.75f + 0.25f * static_cast<float>(HashToUnit(HashCombine(Hash, 17u)));
 	const float G = 0.75f + 0.25f * static_cast<float>(HashToUnit(HashCombine(Hash, 29u)));
 	const float B = 0.75f + 0.25f * static_cast<float>(HashToUnit(HashCombine(Hash, 43u)));
 	return FLinearColor(R, G, B, 1.0f);
+}
+
+static FWishGIProbeSHRecord BuildProbeRecordFromSHCoefficients(const FSolvedProbeSHSignals& Signals, int32 ProbeIndex)
+{
+	FWishGIProbeSHRecord Record;
+	Record.SHCoefficients.SetNum(Signals.CoefficientCount);
+	for (int32 CoefficientIndex = 0; CoefficientIndex < Signals.CoefficientCount; ++CoefficientIndex)
+	{
+		const int32 FlatIndex = SHFlatIndex(ProbeIndex, CoefficientIndex, Signals.CoefficientCount);
+		const float R = Signals.R.IsValidIndex(FlatIndex) ? Signals.R[FlatIndex] : 0.0f;
+		const float G = Signals.G.IsValidIndex(FlatIndex) ? Signals.G[FlatIndex] : 0.0f;
+		const float B = Signals.B.IsValidIndex(FlatIndex) ? Signals.B[FlatIndex] : 0.0f;
+		Record.SHCoefficients[CoefficientIndex] = FLinearColor(R, G, B, 1.0f);
+	}
+
+	if (Record.SHCoefficients.Num() > 0)
+	{
+		Record.Pixel0 = Record.SHCoefficients[0];
+	}
+	if (Record.SHCoefficients.Num() > 1)
+	{
+		Record.Pixel1 = Record.SHCoefficients[1];
+	}
+
+	return Record;
 }
 
 static FWishGIProbeSHRecord BuildProbeRecord(float SignalR, float SignalG, float SignalB, int32 SHOrder, uint32 MeshHash, int32 ProbeIndex)
@@ -2145,6 +2548,7 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 	ProbeMapAsset->TargetSource = WishGIBakeScene::TargetSourceToString(Settings.TargetSource);
 	ProbeMapAsset->SHOrder = Settings.SHOrder;
 	ProbeMapAsset->DirectionCount = Settings.Directions;
+	ProbeMapAsset->SHCoefficientCount = (Settings.TargetSource == WishGIBakeScene::ETargetSource::RayTrace) ? WishGIBakeScene::GetSHCoefficientCount(Settings.SHOrder) : 0;
 	ProbeMapAsset->Lambda = Settings.Lambda;
 	ProbeMapAsset->ProbeMapTexture.Reset();
 	ProbeMapAsset->ProbeRecords.Reset();
@@ -2174,18 +2578,7 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 		}
 
 		const int32 MeshProbeCount = FMath::Clamp(AssocAsset->ProbeCount, 1, 256);
-		WishGIBakeScene::FSolvedSignals Signals;
 		WishGIBakeScene::FTargetStats TargetStats;
-		if (!WishGIBakeScene::SolveProbeSignals(AssocAsset, MeshProbeCount, Settings.Lambda, TargetContext, Signals, TargetStats))
-		{
-			++SkippedMeshCount;
-			UE_LOG(LogWishGIBakeScene, Warning, TEXT("Skipping '%s': failed to build targets/solve."), *AssocAsset->GetPathName());
-			continue;
-		}
-
-		RealSampleQueryAccum += TargetStats.QueryCount;
-		RealSampleValidAccum += TargetStats.ValidCount;
-		RealSampleFallbackVertexAccum += TargetStats.FallbackVertexCount;
 
 		FWishGIProbeMeshRange MeshRange;
 		MeshRange.SourceMesh = AssocAsset->SourceMesh;
@@ -2193,27 +2586,67 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 		MeshRange.ProbeCount = MeshProbeCount;
 		ProbeMapAsset->MeshRanges.Add(MeshRange);
 
-		auto AccStats = [&ResidualAccum, &IterationAccum, &SolvedChannelCount](const WishGIBakeScene::FSolveStats& Stats)
+		if (Settings.TargetSource == WishGIBakeScene::ETargetSource::RayTrace)
 		{
-			if (Stats.Iterations > 0)
+			WishGIBakeScene::FSolvedProbeSHSignals SHSignals;
+			if (!WishGIBakeScene::SolveProbeSHSignalsFromRayTrace(AssocAsset, MeshProbeCount, Settings.Lambda, TargetContext, Settings.SHOrder, SHSignals, TargetStats))
 			{
-				IterationAccum += Stats.Iterations;
-				ResidualAccum += Stats.Residual;
-				SolvedChannelCount += 1;
+				ProbeMapAsset->MeshRanges.Pop();
+				++SkippedMeshCount;
+				UE_LOG(LogWishGIBakeScene, Warning, TEXT("Skipping '%s': failed to build RT SH targets/solve."), *AssocAsset->GetPathName());
+				continue;
 			}
-		};
 
-		AccStats(Signals.StatsR);
-		AccStats(Signals.StatsG);
-		AccStats(Signals.StatsB);
+			RealSampleQueryAccum += TargetStats.QueryCount;
+			RealSampleValidAccum += TargetStats.ValidCount;
+			RealSampleFallbackVertexAccum += TargetStats.FallbackVertexCount;
 
-		const uint32 MeshHash = GetTypeHash(AssocAsset->GetPathName());
-		for (int32 ProbeIndex = 0; ProbeIndex < MeshProbeCount; ++ProbeIndex)
+			IterationAccum += SHSignals.IterationSum;
+			ResidualAccum += SHSignals.ResidualSum;
+			SolvedChannelCount += SHSignals.SolveCount;
+
+			for (int32 ProbeIndex = 0; ProbeIndex < MeshProbeCount; ++ProbeIndex)
+			{
+				ProbeMapAsset->ProbeRecords.Add(WishGIBakeScene::BuildProbeRecordFromSHCoefficients(SHSignals, ProbeIndex));
+			}
+		}
+		else
 		{
-			const float R = Signals.R.IsValidIndex(ProbeIndex) ? Signals.R[ProbeIndex] : 0.0f;
-			const float G = Signals.G.IsValidIndex(ProbeIndex) ? Signals.G[ProbeIndex] : 0.0f;
-			const float B = Signals.B.IsValidIndex(ProbeIndex) ? Signals.B[ProbeIndex] : 0.0f;
-			ProbeMapAsset->ProbeRecords.Add(WishGIBakeScene::BuildProbeRecord(R, G, B, Settings.SHOrder, MeshHash, ProbeIndex));
+			WishGIBakeScene::FSolvedSignals Signals;
+			if (!WishGIBakeScene::SolveProbeSignals(AssocAsset, MeshProbeCount, Settings.Lambda, TargetContext, Signals, TargetStats))
+			{
+				ProbeMapAsset->MeshRanges.Pop();
+				++SkippedMeshCount;
+				UE_LOG(LogWishGIBakeScene, Warning, TEXT("Skipping '%s': failed to build targets/solve."), *AssocAsset->GetPathName());
+				continue;
+			}
+
+			RealSampleQueryAccum += TargetStats.QueryCount;
+			RealSampleValidAccum += TargetStats.ValidCount;
+			RealSampleFallbackVertexAccum += TargetStats.FallbackVertexCount;
+
+			auto AccStats = [&ResidualAccum, &IterationAccum, &SolvedChannelCount](const WishGIBakeScene::FSolveStats& Stats)
+			{
+				if (Stats.Iterations > 0)
+				{
+					IterationAccum += Stats.Iterations;
+					ResidualAccum += Stats.Residual;
+					SolvedChannelCount += 1;
+				}
+			};
+
+			AccStats(Signals.StatsR);
+			AccStats(Signals.StatsG);
+			AccStats(Signals.StatsB);
+
+			const uint32 MeshHash = GetTypeHash(AssocAsset->GetPathName());
+			for (int32 ProbeIndex = 0; ProbeIndex < MeshProbeCount; ++ProbeIndex)
+			{
+				const float R = Signals.R.IsValidIndex(ProbeIndex) ? Signals.R[ProbeIndex] : 0.0f;
+				const float G = Signals.G.IsValidIndex(ProbeIndex) ? Signals.G[ProbeIndex] : 0.0f;
+				const float B = Signals.B.IsValidIndex(ProbeIndex) ? Signals.B[ProbeIndex] : 0.0f;
+				ProbeMapAsset->ProbeRecords.Add(WishGIBakeScene::BuildProbeRecord(R, G, B, Settings.SHOrder, MeshHash, ProbeIndex));
+			}
 		}
 
 		RunningProbeStart += MeshProbeCount;
@@ -2281,6 +2714,8 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 
 	return 0;
 }
+
+
 
 
 
