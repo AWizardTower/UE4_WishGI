@@ -1,4 +1,4 @@
-#include "Commandlets/WishGIBakeSceneCommandlet.h"
+﻿#include "Commandlets/WishGIBakeSceneCommandlet.h"
 
 #include "AssetRegistryModule.h"
 #include "Modules/ModuleManager.h"
@@ -7,6 +7,12 @@
 #include "UObject/Package.h"
 
 #include "Editor.h"
+#include "CollisionQueryParams.h"
+#include "Components/DirectionalLightComponent.h"
+#include "Components/LightComponent.h"
+#include "Components/PointLightComponent.h"
+#include "Components/SpotLightComponent.h"
+#include "Components/SkyLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/Level.h"
 #include "Engine/MapBuildDataRegistry.h"
@@ -60,12 +66,51 @@ struct FSettings
 	bool bHelp = false;
 };
 
+struct FDirectionalLightInfo
+{
+	FVector DirectionToLight = FVector::UpVector;
+	FLinearColor Color = FLinearColor::Black;
+	bool bCastShadows = true;
+};
+
+struct FPointLightInfo
+{
+	FVector Position = FVector::ZeroVector;
+	FLinearColor Color = FLinearColor::Black;
+	float AttenuationRadius = 0.0f;
+	bool bUseInverseSquaredFalloff = true;
+	bool bCastShadows = true;
+};
+
+struct FSpotLightInfo
+{
+	FVector Position = FVector::ZeroVector;
+	FVector Direction = FVector::ForwardVector;
+	FLinearColor Color = FLinearColor::Black;
+	float AttenuationRadius = 0.0f;
+	float InnerConeCos = 1.0f;
+	float OuterConeCos = 1.0f;
+	bool bUseInverseSquaredFalloff = true;
+	bool bCastShadows = true;
+};
+
+struct FSkyLightInfo
+{
+	FLinearColor UpperColor = FLinearColor::Black;
+	FLinearColor LowerColor = FLinearColor::Black;
+	float TraceDistance = 200000.0f;
+};
+
 struct FTargetContext
 {
 	ETargetSource Source = ETargetSource::Synthetic;
     EPrecomputedSource PrecomputedSource = EPrecomputedSource::Auto;
 	UWorld* World = nullptr;
 	TArray<FVector> DirectionSamples;
+	TArray<FDirectionalLightInfo> DirectionalLights;
+	TArray<FPointLightInfo> PointLights;
+	TArray<FSpotLightInfo> SpotLights;
+	TArray<FSkyLightInfo> SkyLights;
 };
 
 struct FTargetStats
@@ -386,6 +431,324 @@ static void GatherMeshInstanceTransforms(UWorld* World, const UStaticMesh* Sourc
 			}
 		}
 	}
+}
+
+static float MaxColorComponent(const FLinearColor& Color)
+{
+	return FMath::Max(Color.R, FMath::Max(Color.G, Color.B));
+}
+
+static FLinearColor CompressLightingRange(const FLinearColor& Lighting)
+{
+	const float R = FMath::Max(0.0f, Lighting.R);
+	const float G = FMath::Max(0.0f, Lighting.G);
+	const float B = FMath::Max(0.0f, Lighting.B);
+	return FLinearColor(
+		R / (1.0f + R),
+		G / (1.0f + G),
+		B / (1.0f + B),
+		1.0f);
+}
+
+static bool TraceVisibilitySegment(UWorld* World, const FVector& Start, const FVector& End)
+{
+	if (!World)
+	{
+		return false;
+	}
+
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(WishGIBakeSceneRTVisibility), true);
+	QueryParams.bTraceComplex = false;
+
+	FHitResult Hit;
+	return !World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, QueryParams);
+}
+
+static bool TraceVisibilityDirection(UWorld* World, const FVector& Start, const FVector& Direction, float Distance)
+{
+	const FVector SafeDirection = Direction.GetSafeNormal();
+	if (!World || SafeDirection.IsNearlyZero() || Distance <= KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+
+	return TraceVisibilitySegment(World, Start, Start + SafeDirection * Distance);
+}
+
+static float ComputeLocalLightFalloff(float Distance, float Radius, bool bUseInverseSquaredFalloff)
+{
+	if (Radius <= KINDA_SMALL_NUMBER || Distance >= Radius)
+	{
+		return 0.0f;
+	}
+
+	const float NormalizedDistance = FMath::Clamp(Distance / Radius, 0.0f, 1.0f);
+	const float Window = FMath::Square(1.0f - NormalizedDistance * NormalizedDistance);
+	if (Window <= KINDA_SMALL_NUMBER)
+	{
+		return 0.0f;
+	}
+
+	if (bUseInverseSquaredFalloff)
+	{
+		const float DistanceMeters = FMath::Max(Distance * 0.01f, 0.1f);
+		return Window / FMath::Square(DistanceMeters);
+	}
+
+	return Window * FMath::Square(1.0f - NormalizedDistance);
+}
+
+static bool IsLightUsable(const ULightComponent* LightComponent)
+{
+	return LightComponent
+		&& !LightComponent->IsPendingKill()
+		&& LightComponent->bAffectsWorld
+		&& LightComponent->IsVisible()
+		&& MaxColorComponent(LightComponent->GetColoredLightBrightness()) > KINDA_SMALL_NUMBER;
+}
+
+static bool IsSkyLightUsable(const USkyLightComponent* SkyLight)
+{
+	return SkyLight
+		&& !SkyLight->IsPendingKill()
+		&& SkyLight->bAffectsWorld
+		&& SkyLight->IsVisible()
+		&& MaxColorComponent(SkyLight->GetLightColor() * SkyLight->Intensity) > KINDA_SMALL_NUMBER;
+}
+
+static void GatherRayTraceLights(UWorld* World, FTargetContext& InOutTargetContext)
+{
+	InOutTargetContext.DirectionalLights.Reset();
+	InOutTargetContext.PointLights.Reset();
+	InOutTargetContext.SpotLights.Reset();
+	InOutTargetContext.SkyLights.Reset();
+
+	if (!World)
+	{
+		return;
+	}
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor || Actor->IsPendingKill())
+		{
+			continue;
+		}
+
+		TInlineComponentArray<ULightComponent*> LightComponents(Actor);
+		Actor->GetComponents(LightComponents);
+		for (ULightComponent* LightComponent : LightComponents)
+		{
+			if (!IsLightUsable(LightComponent))
+			{
+				continue;
+			}
+
+			if (UDirectionalLightComponent* DirectionalLight = Cast<UDirectionalLightComponent>(LightComponent))
+			{
+				FDirectionalLightInfo Info;
+				Info.DirectionToLight = (-DirectionalLight->GetDirection()).GetSafeNormal();
+				if (Info.DirectionToLight.IsNearlyZero())
+				{
+					Info.DirectionToLight = FVector::UpVector;
+				}
+				Info.Color = DirectionalLight->GetColoredLightBrightness();
+				Info.bCastShadows = DirectionalLight->CastShadows != 0;
+				InOutTargetContext.DirectionalLights.Add(Info);
+				continue;
+			}
+
+			if (USpotLightComponent* SpotLight = Cast<USpotLightComponent>(LightComponent))
+			{
+				FSpotLightInfo Info;
+				Info.Position = SpotLight->GetComponentLocation();
+				Info.Direction = SpotLight->GetDirection().GetSafeNormal();
+				if (Info.Direction.IsNearlyZero())
+				{
+					Info.Direction = FVector::ForwardVector;
+				}
+				Info.Color = SpotLight->GetColoredLightBrightness();
+				Info.AttenuationRadius = SpotLight->AttenuationRadius;
+				const float ClampedInnerCone = FMath::Clamp(SpotLight->InnerConeAngle, 0.0f, 89.0f);
+				const float ClampedOuterCone = FMath::Clamp(SpotLight->OuterConeAngle, ClampedInnerCone + 0.001f, 89.0f);
+				Info.InnerConeCos = FMath::Cos(FMath::DegreesToRadians(ClampedInnerCone));
+				Info.OuterConeCos = FMath::Cos(FMath::DegreesToRadians(ClampedOuterCone));
+				Info.bUseInverseSquaredFalloff = SpotLight->bUseInverseSquaredFalloff != 0;
+				Info.bCastShadows = SpotLight->CastShadows != 0;
+				InOutTargetContext.SpotLights.Add(Info);
+				continue;
+			}
+
+			if (UPointLightComponent* PointLight = Cast<UPointLightComponent>(LightComponent))
+			{
+				FPointLightInfo Info;
+				Info.Position = PointLight->GetComponentLocation();
+				Info.Color = PointLight->GetColoredLightBrightness();
+				Info.AttenuationRadius = PointLight->AttenuationRadius;
+				Info.bUseInverseSquaredFalloff = PointLight->bUseInverseSquaredFalloff != 0;
+				Info.bCastShadows = PointLight->CastShadows != 0;
+				InOutTargetContext.PointLights.Add(Info);
+			}
+		}
+
+		TInlineComponentArray<USkyLightComponent*> SkyLightComponents(Actor);
+		Actor->GetComponents(SkyLightComponents);
+		for (USkyLightComponent* SkyLight : SkyLightComponents)
+		{
+			if (!IsSkyLightUsable(SkyLight))
+			{
+				continue;
+			}
+
+			FSkyLightInfo Info;
+			const FLinearColor SkyColor = SkyLight->GetLightColor() * SkyLight->Intensity;
+			Info.UpperColor = SkyColor;
+			Info.LowerColor = SkyLight->bLowerHemisphereIsBlack ? (SkyLight->LowerHemisphereColor * SkyLight->Intensity) : SkyColor;
+			Info.TraceDistance = FMath::Max(10000.0f, SkyLight->SkyDistanceThreshold > 0.0f ? SkyLight->SkyDistanceThreshold * 4.0f : 200000.0f);
+			InOutTargetContext.SkyLights.Add(Info);
+		}
+	}
+
+	UE_LOG(LogWishGIBakeScene, Display, TEXT("Gathered RT lights: Directional=%d, Point=%d, Spot=%d, Sky=%d"),
+		InOutTargetContext.DirectionalLights.Num(),
+		InOutTargetContext.PointLights.Num(),
+		InOutTargetContext.SpotLights.Num(),
+		InOutTargetContext.SkyLights.Num());
+}
+
+static FLinearColor SampleRayTracedLightingAt(const FTargetContext& TargetContext, const FVector& WorldPosition, const FVector& WorldNormal)
+{
+	if (!TargetContext.World)
+	{
+		return FLinearColor::Black;
+	}
+
+	FVector SafeNormal = WorldNormal.GetSafeNormal();
+	if (SafeNormal.IsNearlyZero())
+	{
+		SafeNormal = FVector::UpVector;
+	}
+
+	const FVector TraceStart = WorldPosition + SafeNormal * 2.0f;
+	FLinearColor Accumulated = FLinearColor::Black;
+
+	for (const FDirectionalLightInfo& Light : TargetContext.DirectionalLights)
+	{
+		const float NdotL = FMath::Max(0.0f, FVector::DotProduct(SafeNormal, Light.DirectionToLight));
+		if (NdotL <= 0.0f)
+		{
+			continue;
+		}
+
+		if (Light.bCastShadows && !TraceVisibilityDirection(TargetContext.World, TraceStart, Light.DirectionToLight, 200000.0f))
+		{
+			continue;
+		}
+
+		Accumulated += Light.Color * NdotL;
+	}
+
+	for (const FPointLightInfo& Light : TargetContext.PointLights)
+	{
+		const FVector ToLight = Light.Position - TraceStart;
+		const float Distance = ToLight.Size();
+		if (Distance <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		const float Falloff = ComputeLocalLightFalloff(Distance, Light.AttenuationRadius, Light.bUseInverseSquaredFalloff);
+		if (Falloff <= 0.0f)
+		{
+			continue;
+		}
+
+		const FVector DirectionToLight = ToLight / Distance;
+		const float NdotL = FMath::Max(0.0f, FVector::DotProduct(SafeNormal, DirectionToLight));
+		if (NdotL <= 0.0f)
+		{
+			continue;
+		}
+
+		if (Light.bCastShadows && !TraceVisibilitySegment(TargetContext.World, TraceStart, Light.Position - DirectionToLight))
+		{
+			continue;
+		}
+
+		Accumulated += Light.Color * (NdotL * Falloff);
+	}
+
+	for (const FSpotLightInfo& Light : TargetContext.SpotLights)
+	{
+		const FVector ToLight = Light.Position - TraceStart;
+		const float Distance = ToLight.Size();
+		if (Distance <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		const float Falloff = ComputeLocalLightFalloff(Distance, Light.AttenuationRadius, Light.bUseInverseSquaredFalloff);
+		if (Falloff <= 0.0f)
+		{
+			continue;
+		}
+
+		const FVector DirectionToLight = ToLight / Distance;
+		const float NdotL = FMath::Max(0.0f, FVector::DotProduct(SafeNormal, DirectionToLight));
+		if (NdotL <= 0.0f)
+		{
+			continue;
+		}
+
+		const float CosTheta = FVector::DotProduct(Light.Direction, -DirectionToLight);
+		if (CosTheta <= Light.OuterConeCos)
+		{
+			continue;
+		}
+
+		float ConeFactor = 1.0f;
+		if (Light.InnerConeCos > Light.OuterConeCos)
+		{
+			ConeFactor = FMath::Clamp((CosTheta - Light.OuterConeCos) / (Light.InnerConeCos - Light.OuterConeCos), 0.0f, 1.0f);
+		}
+
+		if (Light.bCastShadows && !TraceVisibilitySegment(TargetContext.World, TraceStart, Light.Position - DirectionToLight))
+		{
+			continue;
+		}
+
+		Accumulated += Light.Color * (NdotL * Falloff * ConeFactor);
+	}
+
+	for (const FSkyLightInfo& Sky : TargetContext.SkyLights)
+	{
+		double SumWeight = 0.0;
+		FLinearColor SkyAccumulated = FLinearColor::Black;
+		for (const FVector& Direction : TargetContext.DirectionSamples)
+		{
+			const float Weight = FMath::Max(0.0f, FVector::DotProduct(SafeNormal, Direction));
+			if (Weight <= 0.0f)
+			{
+				continue;
+			}
+
+			if (!TraceVisibilityDirection(TargetContext.World, TraceStart, Direction, Sky.TraceDistance))
+			{
+				continue;
+			}
+
+			SkyAccumulated += (Direction.Z >= 0.0f ? Sky.UpperColor : Sky.LowerColor) * Weight;
+			SumWeight += Weight;
+		}
+
+		if (SumWeight > 1e-9)
+		{
+			Accumulated += SkyAccumulated / static_cast<float>(SumWeight);
+		}
+	}
+
+	return CompressLightingRange(Accumulated);
 }
 
 static const FPrecomputedLightVolumeData* GetSparseBuildDataForLevel(const ULevel* Level)
@@ -788,6 +1151,70 @@ static void BuildSyntheticTargets(const UWishGIMeshAssocAsset* AssocAsset, FVert
 	}
 }
 
+static bool BuildSurfaceSampleTargetsFromRayTrace(const UWishGIMeshAssocAsset* AssocAsset, const FTargetContext& TargetContext, FSurfaceSampleTargets& OutTargets)
+{
+	OutTargets = FSurfaceSampleTargets();
+	if (!AssocAsset || !TargetContext.World || AssocAsset->SurfaceSamples.Num() <= 0)
+	{
+		return false;
+	}
+
+	const UStaticMesh* SourceMesh = AssocAsset->SourceMesh.LoadSynchronous();
+	TArray<FTransform> InstanceTransforms;
+	GatherMeshInstanceTransforms(TargetContext.World, SourceMesh, InstanceTransforms);
+	if (InstanceTransforms.Num() == 0)
+	{
+		return false;
+	}
+
+	const int32 SampleCount = AssocAsset->SurfaceSamples.Num();
+	OutTargets.R.Init(0.0, SampleCount);
+	OutTargets.G.Init(0.0, SampleCount);
+	OutTargets.B.Init(0.0, SampleCount);
+	OutTargets.ValidMask.Init(0, SampleCount);
+
+	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		const FWishGISurfaceSample& SurfaceSample = AssocAsset->SurfaceSamples[SampleIndex];
+		double AccR = 0.0;
+		double AccG = 0.0;
+		double AccB = 0.0;
+		int32 ValidSamplesForSurfaceSample = 0;
+
+		for (const FTransform& Transform : InstanceTransforms)
+		{
+			const FVector WorldPosition = Transform.TransformPosition(SurfaceSample.LocalPosition);
+			FVector WorldNormal = Transform.TransformVectorNoScale(SurfaceSample.LocalNormal).GetSafeNormal();
+			if (WorldNormal.IsNearlyZero())
+			{
+				WorldNormal = FVector::UpVector;
+			}
+
+			OutTargets.Stats.QueryCount += 1;
+			const FLinearColor Sampled = SampleRayTracedLightingAt(TargetContext, WorldPosition, WorldNormal);
+			OutTargets.Stats.ValidCount += 1;
+			AccR += static_cast<double>(Sampled.R);
+			AccG += static_cast<double>(Sampled.G);
+			AccB += static_cast<double>(Sampled.B);
+			ValidSamplesForSurfaceSample += 1;
+		}
+
+		if (ValidSamplesForSurfaceSample <= 0)
+		{
+			continue;
+		}
+
+		const double InvValidCount = 1.0 / static_cast<double>(ValidSamplesForSurfaceSample);
+		OutTargets.R[SampleIndex] = AccR * InvValidCount;
+		OutTargets.G[SampleIndex] = AccG * InvValidCount;
+		OutTargets.B[SampleIndex] = AccB * InvValidCount;
+		OutTargets.ValidMask[SampleIndex] = 1;
+		OutTargets.bHasAnyRealSample = true;
+	}
+
+	return OutTargets.bHasAnyRealSample;
+}
+
 static bool BuildSurfaceSampleTargetsFromPrecomputedVolume(const UWishGIMeshAssocAsset* AssocAsset, const FTargetContext& TargetContext, FSurfaceSampleTargets& OutTargets)
 {
 	OutTargets = FSurfaceSampleTargets();
@@ -1180,6 +1607,7 @@ static bool BuildTargetsForMesh(const UWishGIMeshAssocAsset* AssocAsset, const F
 		return true;
 	case ETargetSource::PrecomputedVolume:
 		return BuildPrecomputedVolumeTargets(AssocAsset, TargetContext, OutTargets);
+	case ETargetSource::RayTrace:
 	default:
 		return false;
 	}
@@ -1473,10 +1901,20 @@ static bool SolveProbeSignals(
 	FLinearSystemDense SystemB;
 
 	bool bBuiltSystemFromSurfaceSamples = false;
-	if (TargetContext.Source == ETargetSource::PrecomputedVolume && AssocAsset->SurfaceSamples.Num() > 0)
+	if (AssocAsset->SurfaceSamples.Num() > 0)
 	{
 		FSurfaceSampleTargets SurfaceTargets;
-		if (BuildSurfaceSampleTargetsFromPrecomputedVolume(AssocAsset, TargetContext, SurfaceTargets))
+		bool bBuiltTargets = false;
+		if (TargetContext.Source == ETargetSource::PrecomputedVolume)
+		{
+			bBuiltTargets = BuildSurfaceSampleTargetsFromPrecomputedVolume(AssocAsset, TargetContext, SurfaceTargets);
+		}
+		else if (TargetContext.Source == ETargetSource::RayTrace)
+		{
+			bBuiltTargets = BuildSurfaceSampleTargetsFromRayTrace(AssocAsset, TargetContext, SurfaceTargets);
+		}
+
+		if (bBuiltTargets)
 		{
 			OutTargetStats = SurfaceTargets.Stats;
 			BuildSystemsFromSurfaceSamples(AssocAsset, SurfaceTargets, MeshProbeCount, Lambda, SystemR, SystemG, SystemB);
@@ -1579,7 +2017,7 @@ void UWishGIBakeSceneCommandlet::PrintUsage() const
 {
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("WishGI BakeScene Commandlet Usage:"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -run=WishGIBakeScene"));
-	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -Map=/Game/Maps/YourMap (required when -TargetSource=PrecomputedVolume)"));
+	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -Map=/Game/Maps/YourMap (required when -TargetSource=PrecomputedVolume or RayTrace)"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -AssocPath=/Game/WishGI/MeshAssoc"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -OutPath=/Game/WishGI/Bake"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -AssetName=WishGI_ProbeMap"));
@@ -1636,9 +2074,9 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 		return 1;
 	}
 
-	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::Hybrid || Settings.TargetSource == WishGIBakeScene::ETargetSource::RayTrace)
+	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::Hybrid)
 	{
-		UE_LOG(LogWishGIBakeScene, Error, TEXT("TargetSource '%s' is reserved but not implemented yet. Use Synthetic or PrecomputedVolume."), *WishGIBakeScene::TargetSourceToString(Settings.TargetSource));
+		UE_LOG(LogWishGIBakeScene, Error, TEXT("TargetSource '%s' is reserved but not implemented yet. Use Synthetic, PrecomputedVolume, or RayTrace."), *WishGIBakeScene::TargetSourceToString(Settings.TargetSource));
 		return 1;
 	}
 
@@ -1651,24 +2089,29 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 	TargetContext.PrecomputedSource = Settings.PrecomputedSource;
 	WishGIBakeScene::BuildDirectionSamples(Settings.Directions, TargetContext.DirectionSamples);
 
-	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::PrecomputedVolume)
+	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::PrecomputedVolume || Settings.TargetSource == WishGIBakeScene::ETargetSource::RayTrace)
 	{
 		if (Settings.MapPath.IsEmpty())
 		{
-			UE_LOG(LogWishGIBakeScene, Error, TEXT("-Map is required when -TargetSource=PrecomputedVolume."));
+			UE_LOG(LogWishGIBakeScene, Error, TEXT("-Map is required when -TargetSource=%s."), *WishGIBakeScene::TargetSourceToString(Settings.TargetSource));
 			return 2;
 		}
 
 		TargetContext.World = WishGIBakeScene::LoadWorldForSampling(Settings.MapPath);
 		if (!TargetContext.World)
 		{
-			UE_LOG(LogWishGIBakeScene, Error, TEXT("Failed to load map '%s' for precomputed volume sampling."), *Settings.MapPath);
+			UE_LOG(LogWishGIBakeScene, Error, TEXT("Failed to load map '%s' for %s sampling."), *Settings.MapPath, *WishGIBakeScene::TargetSourceToString(Settings.TargetSource));
 			return 2;
 		}
 
-		WishGIBakeScene::LogPrecomputedDataSummary(TargetContext.World);
-
-
+		if (Settings.TargetSource == WishGIBakeScene::ETargetSource::PrecomputedVolume)
+		{
+			WishGIBakeScene::LogPrecomputedDataSummary(TargetContext.World);
+		}
+		else if (Settings.TargetSource == WishGIBakeScene::ETargetSource::RayTrace)
+		{
+			WishGIBakeScene::GatherRayTraceLights(TargetContext.World, TargetContext);
+		}
 	}
 
 	TArray<UWishGIMeshAssocAsset*> AssocAssets;
@@ -1825,6 +2268,10 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::PrecomputedVolume)
 	{
 		UE_LOG(LogWishGIBakeScene, Display, TEXT("PrecomputedSource=%s"), *WishGIBakeScene::PrecomputedSourceToString(Settings.PrecomputedSource));
+	}
+
+	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::PrecomputedVolume || Settings.TargetSource == WishGIBakeScene::ETargetSource::RayTrace)
+	{
 		UE_LOG(LogWishGIBakeScene, Display, TEXT("Real sampling stats: Query=%d, Valid=%d, ValidRatio=%.3f, FallbackVertices=%d"),
 			RealSampleQueryAccum,
 			RealSampleValidAccum,
@@ -1834,6 +2281,8 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 
 	return 0;
 }
+
+
 
 
 
