@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
@@ -10,6 +10,42 @@ USTRUCT(BlueprintType)
 struct FWishGIProbeVertexAssociation
 {
 	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 ProbeIndex0 = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 ProbeIndex1 = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 Weight0 = 255;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 Weight1 = 0;
+};
+
+USTRUCT(BlueprintType)
+struct FWishGISurfaceSample
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	FVector LocalPosition = FVector::ZeroVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	FVector LocalNormal = FVector::UpVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	int32 VertexIndex0 = INDEX_NONE;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	int32 VertexIndex1 = INDEX_NONE;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	int32 VertexIndex2 = INDEX_NONE;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	FVector Barycentric = FVector::ZeroVector;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	uint8 ProbeIndex0 = 0;
@@ -56,6 +92,9 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	int32 RandomSeed = 1337;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	TArray<FWishGISurfaceSample> SurfaceSamples;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
 	TArray<FWishGIProbeVertexAssociation> VertexAssociations;

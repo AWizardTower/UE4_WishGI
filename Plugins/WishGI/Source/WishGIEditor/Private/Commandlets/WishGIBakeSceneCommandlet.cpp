@@ -84,6 +84,16 @@ struct FVertexTargets
 	bool bHasAnyRealSample = false;
 };
 
+struct FSurfaceSampleTargets
+{
+	TArray<double> R;
+	TArray<double> G;
+	TArray<double> B;
+	TArray<uint8> ValidMask;
+	FTargetStats Stats;
+	bool bHasAnyRealSample = false;
+};
+
 struct FLinearSystemDense
 {
 	int32 Size = 0;
@@ -778,6 +788,267 @@ static void BuildSyntheticTargets(const UWishGIMeshAssocAsset* AssocAsset, FVert
 	}
 }
 
+static bool BuildSurfaceSampleTargetsFromPrecomputedVolume(const UWishGIMeshAssocAsset* AssocAsset, const FTargetContext& TargetContext, FSurfaceSampleTargets& OutTargets)
+{
+	OutTargets = FSurfaceSampleTargets();
+	if (!AssocAsset || !TargetContext.World || AssocAsset->SurfaceSamples.Num() <= 0)
+	{
+		return false;
+	}
+
+	const UStaticMesh* SourceMesh = AssocAsset->SourceMesh.LoadSynchronous();
+	TArray<FTransform> InstanceTransforms;
+	GatherMeshInstanceTransforms(TargetContext.World, SourceMesh, InstanceTransforms);
+	if (InstanceTransforms.Num() == 0)
+	{
+		return false;
+	}
+
+	const int32 SampleCount = AssocAsset->SurfaceSamples.Num();
+	OutTargets.R.Init(0.0, SampleCount);
+	OutTargets.G.Init(0.0, SampleCount);
+	OutTargets.B.Init(0.0, SampleCount);
+	OutTargets.ValidMask.Init(0, SampleCount);
+
+	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		const FWishGISurfaceSample& SurfaceSample = AssocAsset->SurfaceSamples[SampleIndex];
+		double AccR = 0.0;
+		double AccG = 0.0;
+		double AccB = 0.0;
+		int32 ValidSamplesForSurfaceSample = 0;
+
+		for (const FTransform& Transform : InstanceTransforms)
+		{
+			const FVector WorldPosition = Transform.TransformPosition(SurfaceSample.LocalPosition);
+			FVector WorldNormal = Transform.TransformVectorNoScale(SurfaceSample.LocalNormal).GetSafeNormal();
+			if (WorldNormal.IsNearlyZero())
+			{
+				WorldNormal = FVector::UpVector;
+			}
+
+			OutTargets.Stats.QueryCount += 1;
+
+			FSHVectorRGB3 Incident;
+			if (!SampleIncidentRadianceAt(TargetContext, WorldPosition, Incident))
+			{
+				continue;
+			}
+
+			OutTargets.Stats.ValidCount += 1;
+			const FLinearColor Sampled = IntegrateEffectiveDirections(Incident, WorldNormal, TargetContext.DirectionSamples);
+			AccR += static_cast<double>(Sampled.R);
+			AccG += static_cast<double>(Sampled.G);
+			AccB += static_cast<double>(Sampled.B);
+			ValidSamplesForSurfaceSample += 1;
+		}
+
+		if (ValidSamplesForSurfaceSample <= 0)
+		{
+			continue;
+		}
+
+		const double InvValidCount = 1.0 / static_cast<double>(ValidSamplesForSurfaceSample);
+		OutTargets.R[SampleIndex] = AccR * InvValidCount;
+		OutTargets.G[SampleIndex] = AccG * InvValidCount;
+		OutTargets.B[SampleIndex] = AccB * InvValidCount;
+		OutTargets.ValidMask[SampleIndex] = 1;
+		OutTargets.bHasAnyRealSample = true;
+	}
+
+	return OutTargets.bHasAnyRealSample;
+}
+
+static void AddAssociationWeight(const FWishGIProbeVertexAssociation& Assoc, double WeightScale, int32 MeshProbeCount, TMap<int32, double>& InOutWeights)
+{
+	if (WeightScale <= 0.0 || MeshProbeCount <= 0)
+	{
+		return;
+	}
+
+	const int32 Probe0 = FMath::Clamp<int32>(Assoc.ProbeIndex0, 0, MeshProbeCount - 1);
+	const int32 Probe1 = FMath::Clamp<int32>(Assoc.ProbeIndex1, 0, MeshProbeCount - 1);
+	const double Weight0 = static_cast<double>(Assoc.Weight0) / 255.0;
+	const double Weight1 = static_cast<double>(Assoc.Weight1) / 255.0;
+
+	InOutWeights.FindOrAdd(Probe0) += WeightScale * Weight0;
+	if (Probe1 != Probe0 && Weight1 > 1e-6)
+	{
+		InOutWeights.FindOrAdd(Probe1) += WeightScale * Weight1;
+	}
+}
+
+static void AccumulateSampleConstraint(
+	const TMap<int32, double>& SampleWeights,
+	double TargetValue,
+	float Lambda,
+	FLinearSystemDense& InOutSystem)
+{
+	TArray<TPair<int32, double>> Terms;
+	Terms.Reserve(SampleWeights.Num());
+	double WeightSum = 0.0;
+
+	for (const TPair<int32, double>& Pair : SampleWeights)
+	{
+		if (Pair.Value > 1e-8)
+		{
+			Terms.Add(Pair);
+			WeightSum += Pair.Value;
+		}
+	}
+
+	if (Terms.Num() == 0 || WeightSum <= 1e-8)
+	{
+		return;
+	}
+
+	for (TPair<int32, double>& Term : Terms)
+	{
+		Term.Value /= WeightSum;
+	}
+
+	for (int32 RowIndex = 0; RowIndex < Terms.Num(); ++RowIndex)
+	{
+		const int32 ProbeRow = Terms[RowIndex].Key;
+		const double WeightRow = Terms[RowIndex].Value;
+		InOutSystem.B[ProbeRow] += WeightRow * TargetValue;
+
+		for (int32 ColIndex = 0; ColIndex < Terms.Num(); ++ColIndex)
+		{
+			const int32 ProbeCol = Terms[ColIndex].Key;
+			const double WeightCol = Terms[ColIndex].Value;
+			At(InOutSystem, ProbeRow, ProbeCol) += WeightRow * WeightCol;
+		}
+	}
+
+	for (int32 Index = 0; Index + 1 < Terms.Num(); ++Index)
+	{
+		const int32 ProbeA = Terms[Index].Key;
+		const int32 ProbeB = Terms[Index + 1].Key;
+		const double EdgeReg = static_cast<double>(Lambda) * 0.05 * (Terms[Index].Value + Terms[Index + 1].Value);
+		At(InOutSystem, ProbeA, ProbeA) += EdgeReg;
+		At(InOutSystem, ProbeB, ProbeB) += EdgeReg;
+		At(InOutSystem, ProbeA, ProbeB) -= EdgeReg;
+		At(InOutSystem, ProbeB, ProbeA) -= EdgeReg;
+	}
+}
+static void AccumulateSurfaceSampleToVertex(int32 VertexIndex, double Weight, const FLinearColor& Sampled, TArray<double>& InOutWeights, FVertexTargets& InOutTargets)
+{
+	if (!InOutWeights.IsValidIndex(VertexIndex) || Weight <= 0.0)
+	{
+		return;
+	}
+
+	InOutWeights[VertexIndex] += Weight;
+	InOutTargets.R[VertexIndex] += static_cast<double>(Sampled.R) * Weight;
+	InOutTargets.G[VertexIndex] += static_cast<double>(Sampled.G) * Weight;
+	InOutTargets.B[VertexIndex] += static_cast<double>(Sampled.B) * Weight;
+}
+
+static bool BuildPrecomputedVolumeTargetsFromSurfaceSamples(const UWishGIMeshAssocAsset* AssocAsset, const FTargetContext& TargetContext, FVertexTargets& OutTargets)
+{
+	if (!AssocAsset || !TargetContext.World || AssocAsset->SurfaceSamples.Num() <= 0)
+	{
+		return false;
+	}
+
+	const UStaticMesh* SourceMesh = AssocAsset->SourceMesh.LoadSynchronous();
+	TArray<FTransform> InstanceTransforms;
+	GatherMeshInstanceTransforms(TargetContext.World, SourceMesh, InstanceTransforms);
+	if (InstanceTransforms.Num() == 0)
+	{
+		return false;
+	}
+
+	const int32 AssocVertexCount = AssocAsset->VertexAssociations.Num();
+	if (AssocVertexCount <= 0)
+	{
+		return false;
+	}
+
+	OutTargets.R.Init(0.0, AssocVertexCount);
+	OutTargets.G.Init(0.0, AssocVertexCount);
+	OutTargets.B.Init(0.0, AssocVertexCount);
+
+	TArray<double> VertexWeightSums;
+	VertexWeightSums.Init(0.0, AssocVertexCount);
+
+	for (const FWishGISurfaceSample& SurfaceSample : AssocAsset->SurfaceSamples)
+	{
+		double AccR = 0.0;
+		double AccG = 0.0;
+		double AccB = 0.0;
+		int32 ValidSamplesForSurfaceSample = 0;
+
+		for (const FTransform& Transform : InstanceTransforms)
+		{
+			const FVector WorldPosition = Transform.TransformPosition(SurfaceSample.LocalPosition);
+			FVector WorldNormal = Transform.TransformVectorNoScale(SurfaceSample.LocalNormal).GetSafeNormal();
+			if (WorldNormal.IsNearlyZero())
+			{
+				WorldNormal = FVector::UpVector;
+			}
+
+			OutTargets.Stats.QueryCount += 1;
+
+			FSHVectorRGB3 Incident;
+			if (!SampleIncidentRadianceAt(TargetContext, WorldPosition, Incident))
+			{
+				continue;
+			}
+
+			OutTargets.Stats.ValidCount += 1;
+			const FLinearColor Sampled = IntegrateEffectiveDirections(Incident, WorldNormal, TargetContext.DirectionSamples);
+			AccR += static_cast<double>(Sampled.R);
+			AccG += static_cast<double>(Sampled.G);
+			AccB += static_cast<double>(Sampled.B);
+			ValidSamplesForSurfaceSample += 1;
+		}
+
+		if (ValidSamplesForSurfaceSample <= 0)
+		{
+			continue;
+		}
+
+		OutTargets.bHasAnyRealSample = true;
+		const double InvValidCount = 1.0 / static_cast<double>(ValidSamplesForSurfaceSample);
+		const FLinearColor AveragedSample(
+			static_cast<float>(AccR * InvValidCount),
+			static_cast<float>(AccG * InvValidCount),
+			static_cast<float>(AccB * InvValidCount),
+			1.0f);
+
+		AccumulateSurfaceSampleToVertex(SurfaceSample.VertexIndex0, static_cast<double>(SurfaceSample.Barycentric.X), AveragedSample, VertexWeightSums, OutTargets);
+		AccumulateSurfaceSampleToVertex(SurfaceSample.VertexIndex1, static_cast<double>(SurfaceSample.Barycentric.Y), AveragedSample, VertexWeightSums, OutTargets);
+		AccumulateSurfaceSampleToVertex(SurfaceSample.VertexIndex2, static_cast<double>(SurfaceSample.Barycentric.Z), AveragedSample, VertexWeightSums, OutTargets);
+	}
+
+	const uint32 MeshHash = GetTypeHash(AssocAsset->GetPathName());
+	for (int32 VertexIndex = 0; VertexIndex < AssocVertexCount; ++VertexIndex)
+	{
+		if (VertexWeightSums[VertexIndex] > 1e-6)
+		{
+			const double InvWeight = 1.0 / VertexWeightSums[VertexIndex];
+			OutTargets.R[VertexIndex] *= InvWeight;
+			OutTargets.G[VertexIndex] *= InvWeight;
+			OutTargets.B[VertexIndex] *= InvWeight;
+		}
+		else
+		{
+			double R = 0.0;
+			double G = 0.0;
+			double B = 0.0;
+			BuildVertexTargetsSynthetic(MeshHash, VertexIndex, R, G, B);
+			OutTargets.R[VertexIndex] = R;
+			OutTargets.G[VertexIndex] = G;
+			OutTargets.B[VertexIndex] = B;
+			OutTargets.Stats.FallbackVertexCount += 1;
+		}
+	}
+
+	return OutTargets.bHasAnyRealSample;
+}
+
 static bool BuildPrecomputedVolumeTargets(const UWishGIMeshAssocAsset* AssocAsset, const FTargetContext& TargetContext, FVertexTargets& OutTargets)
 {
 	if (!AssocAsset || !TargetContext.World)
@@ -792,6 +1063,11 @@ static bool BuildPrecomputedVolumeTargets(const UWishGIMeshAssocAsset* AssocAsse
 		OutTargets.Stats.FallbackVertexCount += AssocVertexCount;
 		return true;
 	};
+
+	if (BuildPrecomputedVolumeTargetsFromSurfaceSamples(AssocAsset, TargetContext, OutTargets))
+	{
+		return true;
+	}
 
 	TArray<FVector> LocalPositions;
 	TArray<FVector> LocalNormals;
@@ -1005,6 +1281,64 @@ static FSolveStats SolveByConjugateGradient(const FLinearSystemDense& System, TA
 	return Stats;
 }
 
+static void BuildSystemsFromSurfaceSamples(
+	const UWishGIMeshAssocAsset* AssocAsset,
+	const FSurfaceSampleTargets& Targets,
+	int32 MeshProbeCount,
+	float Lambda,
+	FLinearSystemDense& OutSystemR,
+	FLinearSystemDense& OutSystemG,
+	FLinearSystemDense& OutSystemB)
+{
+	OutSystemR.Size = MeshProbeCount;
+	OutSystemG.Size = MeshProbeCount;
+	OutSystemB.Size = MeshProbeCount;
+
+	const int32 MatSize = MeshProbeCount * MeshProbeCount;
+	OutSystemR.A.Init(0.0, MatSize);
+	OutSystemG.A.Init(0.0, MatSize);
+	OutSystemB.A.Init(0.0, MatSize);
+	OutSystemR.B.Init(0.0, MeshProbeCount);
+	OutSystemG.B.Init(0.0, MeshProbeCount);
+	OutSystemB.B.Init(0.0, MeshProbeCount);
+
+	const int32 SampleCount = FMath::Min(AssocAsset ? AssocAsset->SurfaceSamples.Num() : 0, Targets.ValidMask.Num());
+	for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+	{
+		if (Targets.ValidMask[SampleIndex] == 0)
+		{
+			continue;
+		}
+
+		const FWishGISurfaceSample& SurfaceSample = AssocAsset->SurfaceSamples[SampleIndex];
+		TMap<int32, double> SampleWeights;
+
+		if (AssocAsset->VertexAssociations.IsValidIndex(SurfaceSample.VertexIndex0))
+		{
+			AddAssociationWeight(AssocAsset->VertexAssociations[SurfaceSample.VertexIndex0], static_cast<double>(SurfaceSample.Barycentric.X), MeshProbeCount, SampleWeights);
+		}
+		if (AssocAsset->VertexAssociations.IsValidIndex(SurfaceSample.VertexIndex1))
+		{
+			AddAssociationWeight(AssocAsset->VertexAssociations[SurfaceSample.VertexIndex1], static_cast<double>(SurfaceSample.Barycentric.Y), MeshProbeCount, SampleWeights);
+		}
+		if (AssocAsset->VertexAssociations.IsValidIndex(SurfaceSample.VertexIndex2))
+		{
+			AddAssociationWeight(AssocAsset->VertexAssociations[SurfaceSample.VertexIndex2], static_cast<double>(SurfaceSample.Barycentric.Z), MeshProbeCount, SampleWeights);
+		}
+
+		AccumulateSampleConstraint(SampleWeights, Targets.R[SampleIndex], Lambda, OutSystemR);
+		AccumulateSampleConstraint(SampleWeights, Targets.G[SampleIndex], Lambda, OutSystemG);
+		AccumulateSampleConstraint(SampleWeights, Targets.B[SampleIndex], Lambda, OutSystemB);
+	}
+
+	const double DiagEpsilon = 1e-4 + static_cast<double>(Lambda) * 1e-3;
+	for (int32 ProbeIndex = 0; ProbeIndex < MeshProbeCount; ++ProbeIndex)
+	{
+		At(OutSystemR, ProbeIndex, ProbeIndex) += DiagEpsilon;
+		At(OutSystemG, ProbeIndex, ProbeIndex) += DiagEpsilon;
+		At(OutSystemB, ProbeIndex, ProbeIndex) += DiagEpsilon;
+	}
+}
 static void BuildSystems(
 	const UWishGIMeshAssocAsset* AssocAsset,
 	const FVertexTargets& Targets,
@@ -1134,17 +1468,32 @@ static bool SolveProbeSignals(
 		return false;
 	}
 
-	FVertexTargets Targets;
-	if (!BuildTargetsForMesh(AssocAsset, TargetContext, Targets))
-	{
-		return false;
-	}
-	OutTargetStats = Targets.Stats;
-
 	FLinearSystemDense SystemR;
 	FLinearSystemDense SystemG;
 	FLinearSystemDense SystemB;
-	BuildSystems(AssocAsset, Targets, MeshProbeCount, Lambda, SystemR, SystemG, SystemB);
+
+	bool bBuiltSystemFromSurfaceSamples = false;
+	if (TargetContext.Source == ETargetSource::PrecomputedVolume && AssocAsset->SurfaceSamples.Num() > 0)
+	{
+		FSurfaceSampleTargets SurfaceTargets;
+		if (BuildSurfaceSampleTargetsFromPrecomputedVolume(AssocAsset, TargetContext, SurfaceTargets))
+		{
+			OutTargetStats = SurfaceTargets.Stats;
+			BuildSystemsFromSurfaceSamples(AssocAsset, SurfaceTargets, MeshProbeCount, Lambda, SystemR, SystemG, SystemB);
+			bBuiltSystemFromSurfaceSamples = true;
+		}
+	}
+
+	if (!bBuiltSystemFromSurfaceSamples)
+	{
+		FVertexTargets Targets;
+		if (!BuildTargetsForMesh(AssocAsset, TargetContext, Targets))
+		{
+			return false;
+		}
+		OutTargetStats = Targets.Stats;
+		BuildSystems(AssocAsset, Targets, MeshProbeCount, Lambda, SystemR, SystemG, SystemB);
+	}
 
 	const int32 MaxIterations = FMath::Clamp(MeshProbeCount * 4, 32, 512);
 	const double Tolerance = 1e-5;
@@ -1485,6 +1834,13 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 
 	return 0;
 }
+
+
+
+
+
+
+
 
 
 
