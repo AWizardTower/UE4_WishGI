@@ -1,4 +1,4 @@
-﻿#include "Commandlets/WishGIBakeSceneCommandlet.h"
+#include "Commandlets/WishGIBakeSceneCommandlet.h"
 
 #include "AssetRegistryModule.h"
 #include "Modules/ModuleManager.h"
@@ -9,11 +9,14 @@
 #include "Editor.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/Level.h"
+#include "Engine/MapBuildDataRegistry.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "GameFramework/WorldSettings.h"
 #include "EngineUtils.h"
 #include "Math/SHMath.h"
 #include "PrecomputedLightVolume.h"
+#include "PrecomputedVolumetricLightmap.h"
 #include "StaticMeshResources.h"
 
 #include "WishGIMeshAssocAsset.h"
@@ -31,8 +34,15 @@ enum class ETargetSource : uint8
 	RayTrace
 };
 
-// 本文件职责：离线 Bake 阶段的数据求解与资产打包。
-// 当前实现：支持可切换目标源（Synthetic / PrecomputedVolume）。
+enum class EPrecomputedSource : uint8
+{
+	Auto,
+	VolumetricLightmap,
+	SparseSamples
+};
+
+// Bake commandlet implementation for offline probe solving and asset packaging.
+// Target source supports Synthetic and PrecomputedVolume with switchable precomputed backends.
 struct FSettings
 {
 	FString MapPath;
@@ -41,6 +51,8 @@ struct FSettings
 	FString AssetName = TEXT("WishGI_ProbeMap");
 	FString TargetSourceName = TEXT("Synthetic");
 	ETargetSource TargetSource = ETargetSource::Synthetic;
+    FString PrecomputedSourceName = TEXT("Auto");
+    EPrecomputedSource PrecomputedSource = EPrecomputedSource::Auto;
 	int32 SHOrder = 2;
 	int32 Directions = 192;
 	float Lambda = 0.1f;
@@ -51,6 +63,7 @@ struct FSettings
 struct FTargetContext
 {
 	ETargetSource Source = ETargetSource::Synthetic;
+    EPrecomputedSource PrecomputedSource = EPrecomputedSource::Auto;
 	UWorld* World = nullptr;
 	TArray<FVector> DirectionSamples;
 };
@@ -157,6 +170,40 @@ static bool ParseTargetSource(const FString& InName, ETargetSource& OutSource)
 	return false;
 }
 
+static FString PrecomputedSourceToString(EPrecomputedSource Source)
+{
+	switch (Source)
+	{
+	case EPrecomputedSource::Auto:
+		return TEXT("Auto");
+	case EPrecomputedSource::VolumetricLightmap:
+		return TEXT("VLM");
+	case EPrecomputedSource::SparseSamples:
+		return TEXT("Sparse");
+	default:
+		return TEXT("Unknown");
+	}
+}
+
+static bool ParsePrecomputedSource(const FString& InName, EPrecomputedSource& OutSource)
+{
+	if (InName.Equals(TEXT("Auto"), ESearchCase::IgnoreCase))
+	{
+		OutSource = EPrecomputedSource::Auto;
+		return true;
+	}
+	if (InName.Equals(TEXT("VLM"), ESearchCase::IgnoreCase) || InName.Equals(TEXT("VolumetricLightmap"), ESearchCase::IgnoreCase))
+	{
+		OutSource = EPrecomputedSource::VolumetricLightmap;
+		return true;
+	}
+	if (InName.Equals(TEXT("Sparse"), ESearchCase::IgnoreCase) || InName.Equals(TEXT("SparseSamples"), ESearchCase::IgnoreCase) || InName.Equals(TEXT("PrecomputedLightVolume"), ESearchCase::IgnoreCase))
+	{
+		OutSource = EPrecomputedSource::SparseSamples;
+		return true;
+	}
+	return false;
+}
 static bool SaveAssetPackage(UPackage* Package, UObject* Asset)
 {
 	if (!Package || !Asset)
@@ -331,25 +378,95 @@ static void GatherMeshInstanceTransforms(UWorld* World, const UStaticMesh* Sourc
 	}
 }
 
-static bool SampleIncidentRadianceAt(const UWorld* World, const FVector& WorldPosition, FSHVectorRGB3& OutIncident)
+static const FPrecomputedLightVolumeData* GetSparseBuildDataForLevel(const ULevel* Level)
+{
+	if (!Level || !Level->MapBuildData || !Level->LevelBuildDataId.IsValid())
+	{
+		return nullptr;
+	}
+
+	return Level->MapBuildData->GetLevelPrecomputedLightVolumeBuildData(Level->LevelBuildDataId);
+}
+
+static const FPrecomputedVolumetricLightmapData* GetVolumetricBuildDataForLevel(const ULevel* Level)
+{
+	if (!Level || !Level->MapBuildData || !Level->LevelBuildDataId.IsValid())
+	{
+		return nullptr;
+	}
+
+	return Level->MapBuildData->GetLevelPrecomputedVolumetricLightmapBuildData(Level->LevelBuildDataId);
+}
+
+static const TCHAR* VolumeLightingMethodToString(EVolumeLightingMethod Method)
+{
+	switch (Method)
+	{
+	case VLM_VolumetricLightmap:
+		return TEXT("VolumetricLightmap");
+	case VLM_SparseVolumeLightingSamples:
+		return TEXT("SparseVolumeLightingSamples");
+	default:
+		return TEXT("Unknown");
+	}
+}
+
+static void LogPrecomputedDataSummary(const UWorld* World)
+{
+	if (!World)
+	{
+		return;
+	}
+
+	const AWorldSettings* WorldSettings = World->GetWorldSettings();
+	UE_LOG(LogWishGIBakeScene, Display, TEXT("Loaded precomputed world '%s': VolumeLightingMethod=%s, Levels=%d"),
+		*World->GetPathName(),
+		VolumeLightingMethodToString(WorldSettings ? WorldSettings->LightmassSettings.VolumeLightingMethod : VLM_VolumetricLightmap),
+		World->GetLevels().Num());
+
+	for (ULevel* Level : World->GetLevels())
+	{
+		const FPrecomputedLightVolumeData* SparseBuildData = GetSparseBuildDataForLevel(Level);
+		const FPrecomputedVolumetricLightmapData* VolumetricBuildData = GetVolumetricBuildDataForLevel(Level);
+		const FBox VolumetricBounds = VolumetricBuildData ? VolumetricBuildData->GetBounds() : FBox(EForceInit::ForceInit);
+		UE_LOG(LogWishGIBakeScene, Display,
+			TEXT("  Level='%s' BuildDataId=%s MapBuildData=%s Sparse=%s SparseInitialized=%d VLM=%s VLMBoundsValid=%d BrickSize=%d IndirectionDims=%s BrickDims=%s"),
+			*GetPathNameSafe(Level),
+			*Level->LevelBuildDataId.ToString(),
+			Level->MapBuildData ? *Level->MapBuildData->GetPathName() : TEXT("None"),
+			SparseBuildData ? TEXT("Yes") : TEXT("No"),
+			SparseBuildData && SparseBuildData->IsInitialized() ? 1 : 0,
+			VolumetricBuildData ? TEXT("Yes") : TEXT("No"),
+			VolumetricBounds.IsValid ? 1 : 0,
+			VolumetricBuildData ? VolumetricBuildData->BrickSize : 0,
+			VolumetricBuildData ? *VolumetricBuildData->IndirectionTextureDimensions.ToString() : TEXT("(0,0,0)"),
+			VolumetricBuildData ? *VolumetricBuildData->BrickDataDimensions.ToString() : TEXT("(0,0,0)"));
+	}
+}
+
+static bool SampleIncidentRadianceFromSparseAt(const UWorld* World, const FVector& WorldPosition, FSHVectorRGB3& OutIncident)
 {
 	if (!World || World->IsPendingKill())
 	{
 		return false;
 	}
 
+	// FPrecomputedLightVolume's destructor is not exported from Engine in UE4.27,
+	// so keep a single commandlet-lifetime instance and never destroy it.
+	static FPrecomputedLightVolume* SparseInterpolator = nullptr;
+	if (!SparseInterpolator)
+	{
+		void* Memory = FMemory::Malloc(sizeof(FPrecomputedLightVolume));
+		SparseInterpolator = new (Memory) FPrecomputedLightVolume();
+	}
+
 	float TotalWeight = 0.0f;
 	FSHVectorRGB3 AccumulatedIncident;
 
-		for (ULevel* Level : World->GetLevels())
+	for (ULevel* Level : World->GetLevels())
 	{
-		if (!Level || !Level->PrecomputedLightVolume)
-		{
-			continue;
-		}
-
-		const FPrecomputedLightVolume* PrecomputedLightVolume = Level->PrecomputedLightVolume;
-		if (!PrecomputedLightVolume->IsAddedToScene() || !PrecomputedLightVolume->Data || !PrecomputedLightVolume->Data->IsInitialized())
+		const FPrecomputedLightVolumeData* SparseBuildData = GetSparseBuildDataForLevel(Level);
+		if (!Level || !World->Scene || !SparseBuildData || !SparseBuildData->IsInitialized())
 		{
 			continue;
 		}
@@ -358,7 +475,9 @@ static bool SampleIncidentRadianceAt(const UWorld* World, const FVector& WorldPo
 		float DirectionalShadowing = 0.0f;
 		FSHVectorRGB3 Incident;
 		FVector SkyBentNormal = FVector::ZeroVector;
-		PrecomputedLightVolume->InterpolateIncidentRadiancePoint(WorldPosition, Weight, DirectionalShadowing, Incident, SkyBentNormal);
+
+		SparseInterpolator->SetData(SparseBuildData, World->Scene);
+		SparseInterpolator->InterpolateIncidentRadiancePoint(WorldPosition, Weight, DirectionalShadowing, Incident, SkyBentNormal);
 
 		if (Weight > KINDA_SMALL_NUMBER)
 		{
@@ -376,6 +495,209 @@ static bool SampleIncidentRadianceAt(const UWorld* World, const FVector& WorldPo
 	return true;
 }
 
+static bool DecodeVolumetricLightmapIncidentRadiance(
+	const FPrecomputedVolumetricLightmapData& VolumetricLightmapData,
+	const FVector& BrickTextureCoordinate,
+	FSHVectorRGB3& OutIncident)
+{
+	if (VolumetricLightmapData.BrickData.AmbientVector.Data.Num() <= 0)
+	{
+		return false;
+	}
+
+	for (int32 CoefficientIndex = 0; CoefficientIndex < UE_ARRAY_COUNT(VolumetricLightmapData.BrickData.SHCoefficients); ++CoefficientIndex)
+	{
+		if (VolumetricLightmapData.BrickData.SHCoefficients[CoefficientIndex].Data.Num() <= 0)
+		{
+			return false;
+		}
+	}
+
+	const FVector AmbientVector = (FVector)FilteredVolumeLookup<FFloat3Packed>(
+		BrickTextureCoordinate,
+		VolumetricLightmapData.BrickDataDimensions,
+		(const FFloat3Packed*)VolumetricLightmapData.BrickData.AmbientVector.Data.GetData());
+
+	auto ReadSHCoefficient = [&BrickTextureCoordinate, &VolumetricLightmapData, &AmbientVector](uint32 CoefficientIndex)
+	{
+		const FLinearColor SHDenormalizationScales0(
+			0.488603f / 0.282095f,
+			0.488603f / 0.282095f,
+			0.488603f / 0.282095f,
+			1.092548f / 0.282095f);
+
+		const FLinearColor SHDenormalizationScales1(
+			1.092548f / 0.282095f,
+			4.0f * 0.315392f / 0.282095f,
+			1.092548f / 0.282095f,
+			2.0f * 0.546274f / 0.282095f);
+
+		FLinearColor SHCoefficientEncoded = FilteredVolumeLookup<FColor>(
+			BrickTextureCoordinate,
+			VolumetricLightmapData.BrickDataDimensions,
+			(const FColor*)VolumetricLightmapData.BrickData.SHCoefficients[CoefficientIndex].Data.GetData());
+
+		Swap(SHCoefficientEncoded.R, SHCoefficientEncoded.B);
+
+		const FLinearColor& DenormalizationScales = ((CoefficientIndex & 1) == 0) ? SHDenormalizationScales0 : SHDenormalizationScales1;
+		return FVector4((SHCoefficientEncoded * 2.0f - FLinearColor(1.0f, 1.0f, 1.0f, 1.0f)) * AmbientVector[CoefficientIndex / 2] * DenormalizationScales);
+	};
+
+	auto BuildSHVector = [](float Ambient, const FVector4& Coeffs0, const FVector4& Coeffs1)
+	{
+		FSHVector3 Result;
+		Result.V[0] = Ambient;
+		FMemory::Memcpy(&Result.V[1], &Coeffs0, sizeof(Coeffs0));
+		FMemory::Memcpy(&Result.V[5], &Coeffs1, sizeof(Coeffs1));
+		return Result;
+	};
+
+	OutIncident.R = BuildSHVector(AmbientVector.X, ReadSHCoefficient(0), ReadSHCoefficient(1));
+	OutIncident.G = BuildSHVector(AmbientVector.Y, ReadSHCoefficient(2), ReadSHCoefficient(3));
+	OutIncident.B = BuildSHVector(AmbientVector.Z, ReadSHCoefficient(4), ReadSHCoefficient(5));
+
+	if (VolumetricLightmapData.BrickData.LQLightColor.Data.Num() > 0 && VolumetricLightmapData.BrickData.LQLightDirection.Data.Num() > 0)
+	{
+		const FLinearColor LQLightColor = FilteredVolumeLookup<FFloat3Packed>(
+			BrickTextureCoordinate,
+			VolumetricLightmapData.BrickDataDimensions,
+			(const FFloat3Packed*)VolumetricLightmapData.BrickData.LQLightColor.Data.GetData());
+
+		FVector LQLightDirection = (FVector)FilteredVolumeLookup<FColor>(
+			BrickTextureCoordinate,
+			VolumetricLightmapData.BrickDataDimensions,
+			(const FColor*)VolumetricLightmapData.BrickData.LQLightDirection.Data.GetData());
+
+		Swap(LQLightDirection.X, LQLightDirection.Z);
+		LQLightDirection = LQLightDirection * 2.0f - FVector(1.0f, 1.0f, 1.0f);
+		if (!LQLightDirection.Normalize())
+		{
+			LQLightDirection = FVector::UpVector;
+		}
+
+		OutIncident.AddIncomingRadiance(LQLightColor, 1.0f, LQLightDirection);
+	}
+
+	return true;
+}
+
+static bool SampleIncidentRadianceFromVLMAt(const UWorld* World, const FVector& WorldPosition, FSHVectorRGB3& OutIncident)
+{
+	if (!World || World->IsPendingKill())
+	{
+		return false;
+	}
+
+	int32 ValidLevelCount = 0;
+	FSHVectorRGB3 AccumulatedIncident;
+
+	for (ULevel* Level : World->GetLevels())
+	{
+		const FPrecomputedVolumetricLightmapData* GlobalData = GetVolumetricBuildDataForLevel(Level);
+		if (!GlobalData)
+		{
+			continue;
+		}
+
+		if (!GlobalData->GetBounds().IsValid || GlobalData->IndirectionTexture.Data.Num() <= 0 || GlobalData->BrickSize <= 0)
+		{
+			continue;
+		}
+
+		const FVector IndirectionCoordinate = ComputeIndirectionCoordinate(WorldPosition, GlobalData->GetBounds(), GlobalData->IndirectionTextureDimensions);
+
+		FIntVector BrickOffset = FIntVector::ZeroValue;
+		int32 BrickSize = 0;
+		int32 SubLevelIndex = 0;
+
+		if (GlobalData->CPUSubLevelBrickDataList.Num() > 0 && GlobalData->CPUSubLevelIndirectionTable.Num() > 0)
+		{
+			SampleIndirectionTextureWithSubLevel(
+				IndirectionCoordinate,
+				GlobalData->IndirectionTextureDimensions,
+				GlobalData->IndirectionTexture.Data.GetData(),
+				GlobalData->CPUSubLevelIndirectionTable,
+				BrickOffset,
+				BrickSize,
+				SubLevelIndex);
+		}
+		else
+		{
+			SampleIndirectionTexture(
+				IndirectionCoordinate,
+				GlobalData->IndirectionTextureDimensions,
+				GlobalData->IndirectionTexture.Data.GetData(),
+				BrickOffset,
+				BrickSize);
+		}
+
+		if (BrickSize <= 0)
+		{
+			continue;
+		}
+
+		const FPrecomputedVolumetricLightmapData* SampleData = nullptr;
+		if (GlobalData->CPUSubLevelBrickDataList.IsValidIndex(SubLevelIndex) && GlobalData->CPUSubLevelBrickDataList[SubLevelIndex])
+		{
+			SampleData = GlobalData->CPUSubLevelBrickDataList[SubLevelIndex];
+		}
+		if (!SampleData)
+		{
+			SampleData = GlobalData;
+		}
+
+		if (SampleData->BrickDataDimensions.GetMin() <= 0)
+		{
+			continue;
+		}
+
+		const FVector BrickTextureCoordinate = ComputeBrickTextureCoordinate(
+			IndirectionCoordinate,
+			BrickOffset,
+			BrickSize,
+			SampleData->BrickSize);
+
+		FSHVectorRGB3 Incident;
+		if (!DecodeVolumetricLightmapIncidentRadiance(*SampleData, BrickTextureCoordinate, Incident))
+		{
+			continue;
+		}
+
+		AccumulatedIncident += Incident;
+		ValidLevelCount += 1;
+	}
+
+	if (ValidLevelCount <= 0)
+	{
+		return false;
+	}
+
+	OutIncident = AccumulatedIncident / static_cast<float>(ValidLevelCount);
+	return true;
+}
+
+static bool SampleIncidentRadianceAt(const FTargetContext& TargetContext, const FVector& WorldPosition, FSHVectorRGB3& OutIncident)
+{
+	if (!TargetContext.World || TargetContext.World->IsPendingKill())
+	{
+		return false;
+	}
+
+	switch (TargetContext.PrecomputedSource)
+	{
+	case EPrecomputedSource::VolumetricLightmap:
+		return SampleIncidentRadianceFromVLMAt(TargetContext.World, WorldPosition, OutIncident);
+	case EPrecomputedSource::SparseSamples:
+		return SampleIncidentRadianceFromSparseAt(TargetContext.World, WorldPosition, OutIncident);
+	case EPrecomputedSource::Auto:
+	default:
+		if (SampleIncidentRadianceFromVLMAt(TargetContext.World, WorldPosition, OutIncident))
+		{
+			return true;
+		}
+		return SampleIncidentRadianceFromSparseAt(TargetContext.World, WorldPosition, OutIncident);
+	}
+}
 static FLinearColor IntegrateEffectiveDirections(const FSHVectorRGB3& Incident, const FVector& WorldNormal, const TArray<FVector>& Directions)
 {
 	FVector SafeNormal = WorldNormal.GetSafeNormal();
@@ -518,7 +840,7 @@ static bool BuildPrecomputedVolumeTargets(const UWishGIMeshAssocAsset* AssocAsse
 			OutTargets.Stats.QueryCount += 1;
 
 			FSHVectorRGB3 Incident;
-			if (!SampleIncidentRadianceAt(TargetContext.World, WorldPosition, Incident))
+			if (!SampleIncidentRadianceAt(TargetContext, WorldPosition, Incident))
 			{
 				continue;
 			}
@@ -913,13 +1235,13 @@ void UWishGIBakeSceneCommandlet::PrintUsage() const
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -OutPath=/Game/WishGI/Bake"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -AssetName=WishGI_ProbeMap"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -TargetSource=Synthetic|PrecomputedVolume|Hybrid|RayTrace"));
+	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -PrecomputedSource=Auto|VLM|Sparse (used when -TargetSource=PrecomputedVolume)"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -SHOrder=2"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -Directions=192"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -Lambda=0.1"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -Overwrite"));
 	UE_LOG(LogWishGIBakeScene, Display, TEXT("  -Help"));
 }
-
 int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 {
 	WishGIBakeScene::FSettings Settings;
@@ -928,6 +1250,7 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 	FParse::Value(*Params, TEXT("OutPath="), Settings.OutPath);
 	FParse::Value(*Params, TEXT("AssetName="), Settings.AssetName);
 	FParse::Value(*Params, TEXT("TargetSource="), Settings.TargetSourceName);
+	FParse::Value(*Params, TEXT("PrecomputedSource="), Settings.PrecomputedSourceName);
 	FParse::Value(*Params, TEXT("SHOrder="), Settings.SHOrder);
 	FParse::Value(*Params, TEXT("Directions="), Settings.Directions);
 	FParse::Value(*Params, TEXT("Lambda="), Settings.Lambda);
@@ -958,6 +1281,12 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 		return 1;
 	}
 
+	if (!WishGIBakeScene::ParsePrecomputedSource(Settings.PrecomputedSourceName, Settings.PrecomputedSource))
+	{
+		UE_LOG(LogWishGIBakeScene, Error, TEXT("Invalid PrecomputedSource '%s'."), *Settings.PrecomputedSourceName);
+		return 1;
+	}
+
 	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::Hybrid || Settings.TargetSource == WishGIBakeScene::ETargetSource::RayTrace)
 	{
 		UE_LOG(LogWishGIBakeScene, Error, TEXT("TargetSource '%s' is reserved but not implemented yet. Use Synthetic or PrecomputedVolume."), *WishGIBakeScene::TargetSourceToString(Settings.TargetSource));
@@ -970,6 +1299,7 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 
 	WishGIBakeScene::FTargetContext TargetContext;
 	TargetContext.Source = Settings.TargetSource;
+	TargetContext.PrecomputedSource = Settings.PrecomputedSource;
 	WishGIBakeScene::BuildDirectionSamples(Settings.Directions, TargetContext.DirectionSamples);
 
 	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::PrecomputedVolume)
@@ -986,6 +1316,10 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 			UE_LOG(LogWishGIBakeScene, Error, TEXT("Failed to load map '%s' for precomputed volume sampling."), *Settings.MapPath);
 			return 2;
 		}
+
+		WishGIBakeScene::LogPrecomputedDataSummary(TargetContext.World);
+
+
 	}
 
 	TArray<UWishGIMeshAssocAsset*> AssocAssets;
@@ -1141,6 +1475,7 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 
 	if (Settings.TargetSource == WishGIBakeScene::ETargetSource::PrecomputedVolume)
 	{
+		UE_LOG(LogWishGIBakeScene, Display, TEXT("PrecomputedSource=%s"), *WishGIBakeScene::PrecomputedSourceToString(Settings.PrecomputedSource));
 		UE_LOG(LogWishGIBakeScene, Display, TEXT("Real sampling stats: Query=%d, Valid=%d, ValidRatio=%.3f, FallbackVertices=%d"),
 			RealSampleQueryAccum,
 			RealSampleValidAccum,
@@ -1150,9 +1485,6 @@ int32 UWishGIBakeSceneCommandlet::Main(const FString& Params)
 
 	return 0;
 }
-
-
-
 
 
 
