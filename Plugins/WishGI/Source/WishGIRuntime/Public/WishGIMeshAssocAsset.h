@@ -1,94 +1,101 @@
-﻿#pragma once
+#pragma once
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
-#include "WishGIProbeMapAsset.generated.h"
+#include "WishGIMeshAssocAsset.generated.h"
 
 class UStaticMesh;
-class UTexture2D;
 
 USTRUCT(BlueprintType)
-struct FWishGIProbeSHRecord
+struct FWishGIProbeVertexAssociation
 {
 	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	FLinearColor Pixel0 = FLinearColor::Black;
+	uint8 ProbeIndex0 = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	FLinearColor Pixel1 = FLinearColor::Black;
+	uint8 ProbeIndex1 = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	TArray<FLinearColor> SHCoefficients;
+	uint8 Weight0 = 255;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 Weight1 = 0;
 };
 
 USTRUCT(BlueprintType)
-struct FWishGIProbeMeshRange
+struct FWishGISurfaceSample
 {
 	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	TSoftObjectPtr<UStaticMesh> SourceMesh;
+	FVector LocalPosition = FVector::ZeroVector;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 ProbeStart = 0;
+	FVector LocalNormal = FVector::UpVector;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 ProbeCount = 0;
+	int32 VertexIndex0 = INDEX_NONE;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	int32 VertexIndex1 = INDEX_NONE;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	int32 VertexIndex2 = INDEX_NONE;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	FVector Barycentric = FVector::ZeroVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 ProbeIndex0 = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 ProbeIndex1 = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 Weight0 = 255;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
+	uint8 Weight1 = 0;
 };
 
 UCLASS(BlueprintType)
-class WISHGIEDITOR_API UWishGIProbeMapAsset : public UDataAsset
+class WISHGIRUNTIME_API UWishGIMeshAssocAsset : public UDataAsset
 {
 	GENERATED_BODY()
 
 public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	FString SourceMapPath;
+	TSoftObjectPtr<UStaticMesh> SourceMesh;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	FString TargetSource = TEXT("Synthetic");
+	int32 LODIndex = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 SHOrder = 2;
+	int32 VertexCount = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 DirectionCount = 192;
+	int32 ProbeCount = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 SHCoefficientCount = 0;
+	float SampleDensity = 100.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	float Lambda = 0.1f;
+	int32 AssociationsPerVertex = 2;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 TotalProbeCount = 0;
+	int32 GeneratedSampleCount = 0;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 SolverIterations = 0;
+	int32 KMeansIterations = 8;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	float SolverResidual = 0.0f;
+	int32 RandomSeed = 1337;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 RealSampleQueryCount = 0;
+	TArray<FWishGISurfaceSample> SurfaceSamples;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	int32 RealSampleValidCount = 0;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	float RealSampleValidRatio = 0.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	FIntPoint SuggestedProbeMapSize = FIntPoint::ZeroValue;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	TSoftObjectPtr<UTexture2D> ProbeMapTexture;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	TArray<FWishGIProbeSHRecord> ProbeRecords;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WishGI")
-	TArray<FWishGIProbeMeshRange> MeshRanges;
+	TArray<FWishGIProbeVertexAssociation> VertexAssociations;
 };
-

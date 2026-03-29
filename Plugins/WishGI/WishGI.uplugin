@@ -11,6 +11,11 @@
 	"IsBetaVersion": true,
 	"Modules": [
 		{
+			"Name": "WishGIRuntime",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
 			"Name": "WishGIEditor",
 			"Type": "Editor",
 			"LoadingPhase": "Default"

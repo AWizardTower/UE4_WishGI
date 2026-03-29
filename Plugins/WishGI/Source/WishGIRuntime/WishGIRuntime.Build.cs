@@ -2,9 +2,9 @@
 
 using UnrealBuildTool;
 
-public class WishGIEditor : ModuleRules
+public class WishGIRuntime : ModuleRules
 {
-	public WishGIEditor(ReadOnlyTargetRules Target) : base(Target)
+	public WishGIRuntime(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
@@ -20,11 +20,6 @@ public class WishGIEditor : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"AssetRegistry",
-				"RenderCore",
-				"RHI",
-				"UnrealEd",
-				"WishGIRuntime"
 			}
 		);
 	}
